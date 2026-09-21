@@ -9,15 +9,16 @@
 
 > **致谢**：本项目基于原教程作者的开仓教程 [a756598009-CMYK/MiniMax-H3-AMD7900XTX-Win11](https://github.com/a756598009-CMYK/MiniMax-H3-AMD7900XTX-Win11) 完成部署，模型整合包与工作流思路均来自作者，在此致敬。本文档记录的是在其基础上的提速调优与排障经验。
 
-> **最新成绩（2026-09-21，热态实测）**
+> **实测成绩（2026-09-21 热态记录，均为 124 帧 / 6 步）**
 >
-> | 任务 | 参数 | 总耗时 |
+> | 任务 | 分辨率 | 总耗时 |
 > |---|---|---|
-> | 文生视频 T2V | 608×352 / 124帧 / 6步 | **90 秒** |
-> | 参考图生视频 R2V（双参考图） | 608×352 / 124帧 / 6步 / max保脸 | **105~142 秒** |
-> | 参考图生视频 R2V（单参考图） | 608×352 / 124帧 / 6步 / max保脸 | **178 秒**（基准） |
+> | 文生视频 T2V | 608×352（0.2MP） | **91 秒** |
+> | 参考图生视频 R2V（双图） | 352×608（0.2MP） | **106~143 秒** |
+> | 首图生视频 I2V | 832×480（0.4MP） | **197~222 秒** |
+> | 参考图生视频 R2V（双图，竖屏） | 480×832（0.4MP） | **255 秒** |
 >
-> 同日起点为 11~15 分钟（I2V）/ 34 分钟（R2V），总提速约 **7~14 倍**。
+> 同日起点为 11~15 分钟（I2V）/ 34 分钟（R2V），总提速约 **8~14 倍**。
 
 ---
 
@@ -39,7 +40,7 @@
 |---|---|---|
 | PyTorch | **2.15.0a0+rocm10.1 nightly**（gfx1100 专用） | 来自 AMD 官方 nightly 源，是最大的单项提速 |
 | ROCm | 10.1（HIP 7.16） | 随 torch nightly 以 pip 包形式安装 |
-| sage-attention | **2.2 自动调优版**（patientx 编译） | 注意力加速；已锁定冠军配置跳过逐形状跑分（见第十节） |
+| sage-attention | **2.2 自动调优版**（patientx 编译） | 注意力加速；已锁定冠军配置跳过逐形状跑分（见第九节） |
 | Triton | triton-windows 3.7.1 | 自定义内核编译器 |
 | INT8 加速 | ComfyUI-INT8-Fast-ROCM（patientx） | H3 INT8 模型的 WMMA/hipBLASLt INT8 GEMM |
 | Spectrum | ComfyUI-Spectrum-MiniMax-H3（xmarre） | 切比雪夫特征预测，跳过约 1/3 采样步的 transformer 计算 |
@@ -87,22 +88,28 @@ python_embeded\python.exe -s ComfyUI\main.py --windows-standalone-build --use-sa
 ## 五、工作流提速配置要点（参考图生视频 R2V）
 
 1. **加载器用 `MiniMaxH3INT8FastLoader`**（INT8-Fast-ROCM 的 minimax h3 预设）—— INT8 模型直读 + WMMA 加速
-2. **Turbo LoRA + 6 步**：6 步是甜点位。实测 10 步多花 67% 采样时间，且 turbo 蒸馏 LoRA 步数过多会过曝偏色，画质反而变差
+2. **Turbo LoRA + 6 步**：6 步是甜点位。0.4MP 实测 6 步 255 秒 vs 10 步 262 秒，总耗时几乎无差（采样只占一半，且 Spectrum 会跳过部分步）；但 turbo 蒸馏 LoRA 步数过多可能过曝偏色，仍建议锁定 6 步
 3. **`ref_image_size=max`：保脸的关键**。match 模式会把参考图压到生成分辨率（几十万像素），脸必崩；max 用 2048px 短边保身份，代价是慢，但值得
 4. **Spectrum 节点串在 LoRA 之后**：约 1/3 步数用预测代替实算；若发现画面细节变差，节点右键 Bypass 即可回退
 5. **随机种子设为 randomize**：ComfyUI 有增量执行——参考图和提示词不变时，重跑自动跳过整个编码阶段（省掉最大的单块时间）。种子随机保证每次出新片
-6. 分辨率 608×352、124 帧（24fps ≈ 5 秒）是 20GB 显存的甜点位
+6. 分辨率 608×352、124 帧（24fps ≈ 5 秒）是 20GB 显存的甜点位；0.4MP（480×832 / 832×480）同样可稳定使用，见第六节
 
-## 六、参数安全区（20GB 显存，2026-09-21 实测）
+## 六、参数安全区与实测耗时（20GB 显存，2026-09-21 热态记录）
 
-| 参数组合 | 结果 |
-|---|---|
-| 608×352 / 124帧 / 6步 | ✅ 安全甜点位，T2V 90 秒、R2V 105~178 秒 |
-| 480×832 竖屏 / 124帧 / 10步 | ⚠️ 边缘：总耗时 10~12 分钟，仅解码就约 5 分钟 |
-| 480×832 竖屏 / 124帧（连续多跑） | ❌ 实测触发 VAE 解码阶段**真死锁**（见第九节），需重启进程 |
-| 步数 6 → 10 | ❌ 多花 67% 时间，turbo LoRA 下过曝偏色，无画质收益 |
+| 参数组合（均为 124 帧） | 实测总耗时 | 结论 |
+|---|---|---|
+| 608×352 / 6步 / T2V | 91 秒 | ✅ 最快 |
+| 352×608 / 6步 / R2V 双图 | 106~143 秒 | ✅ |
+| 832×480（0.4MP 横屏）/ 6步 / I2V | 197~222 秒 | ✅ |
+| 480×832（0.4MP 竖屏）/ 6步 / R2V 双图 | 255 秒 | ✅ 可用 |
+| 480×832 / 10步 / R2V 双图 | 262 秒 | 与 6 步几乎无差，没必要加步 |
+| 480×832 / 冷态或系统高负载期 | 曾出现 10~20 分钟，并触发过一次解码真死锁 | ⚠️ 异常期表现，不是真实速度（见第八、九节） |
 
-**经验法则**：解码阶段中间激活值与像素数成正比。480×832 比 608×352 多 87% 像素，采样、解码全部同比变慢，且解码显存峰值逼近动态调度器能腾出的上限。想拍竖屏，减帧数（61/89 帧）比硬顶 124 帧稳。
+**经验法则**：
+
+- 0.4MP 比 0.2MP 慢约 2~2.5 倍（超线性），瓶颈在编码与解码，不在采样
+- VAE 解码阶段**没有进度条**，0.4MP 解码要数分钟，日志沉默≠卡死
+- 判断快慢以「连跑第二条」为准；冷态第一条的价格见第八节
 
 ## 七、速度演进实测（同一台 7900 XT）
 
@@ -112,16 +119,16 @@ python_embeded\python.exe -s ComfyUI\main.py --windows-standalone-build --use-sa
 | +sage 1.0.6、reserve-vram 1.0 | | ~26 分钟 | 55~73 秒/步 |
 | +Spectrum | | 22 分钟 | — |
 | +nightly torch + sage 2.2 | | 178 秒 | 9~17 秒/步 |
-| **最终（热态连跑）** | 同上 | **R2V 双图 105~142 秒 / T2V 90 秒** | **7.2~13.7 秒/步** |
+| **最终（热态连跑）** | 同上 | **T2V 91秒 / R2V 0.2MP 106~143秒 / 0.4MP 197~262秒** | **7.2~20 秒/步** |
 
 ## 八、冷态与热态——"突然变慢"的最大误会来源（2026-09-21 全天追查结论）
 
-同一天内实测到同一条基准任务 178 秒 → 589 秒 → 又回到 105 秒。最终定位**机器没有任何硬件/驱动退化**，波动全部来自冷态成本：
+同一天内实测到同一条基准任务 178 秒 → 589 秒 → 又回到 91~262 秒。最终定位**机器没有任何硬件/驱动退化**，波动全部来自冷态成本：
 
 1. **冷加载**：重启 ComfyUI（或长时间不用模型被卸出）后，第一趟要从硬盘重读约 35GB（19.5GB 主模型 + 15GB 文本编码器 + 双 VAE），再加 41 秒 Model 初始化。这一趟 8~10 分钟是正常的
 2. **磁盘缓存被洗掉**：短时间内下载/删除几十 GB 文件（例如试新模型）、Windows 大版本更新后的开机后台整理，都会把文件缓存冲掉。此时实测 python 冷读只剩 **74 MB/s**（正常 1500+ MB/s），加载时间翻 10 倍
 3. **磁盘被抢**：下载、哈希校验、杀毒扫描等并发磁盘活动会把模型加载拖到几分钟
-4. **热态才是真实速度**：模型常驻后连跑，采样 7~14 秒/步、编码可完全跳过，T2V 90 秒一条
+4. **热态才是真实速度**：模型常驻后连跑，采样 7~20 秒/步、编码可完全跳过，T2V 91 秒一条
 
 **结论**：判断快慢要看「连跑第二条」的耗时；重启后第一条慢 ≠ 机器变慢。
 
@@ -133,7 +140,7 @@ ComfyUI 的 tqdm 进度条有缓冲、VAE 解码阶段**完全不打印进度**�
 |---|---|---|---|---|
 | 编码/加载中 | ~0% | 有 | 持续读取 | 假卡死，等 |
 | 采样中 | 95~100% 持续 | 低 | ~0 | 正常 |
-| **VAE 解码中** | **180~340% 满负荷** | 单核忙 | ~0 | **假卡死**（日志无进度条，480×832 解码约 5 分钟，等） |
+| **VAE 解码中** | **180~340% 满负荷** | 单核忙 | ~0 | **假卡死**（日志无进度条，0.4MP 解码数分钟，等） |
 | **真死锁** | **0%** | **0.00s** | **0 MB/s** | 真死，杀进程重启 |
 
 ```powershell
@@ -218,7 +225,7 @@ pip 包备份：`D:\ai\pip_freeze_backup.txt`；nightly 安装包留存：`D:\ai
 | 2026-09-08 | 完成部署，打通 R2V 工作流；解决 ComfyUI-Manager 缺失、Easy-Use 扩展报错 |
 | 2026-09-09 | 调优至 178 秒基准；整理 MP 像素-分辨率对照 |
 | 2026-09-12 | 修复 sage 自动调优卡死（锁定冠军配置）；恢复快速启动模式 |
-| 2026-09-21 | 全天追查"变慢"：证实机器无退化（磁盘 1526MB/s、热态 7.2s/it），定位为冷态成本 + 10 步 + 竖屏大分辨率叠加；试 FastH3 4 步模型后放弃并清除；最终热态成绩 T2V 90 秒、R2V 双图 105~142 秒 |
+| 2026-09-21 | 全天追查"变慢"：证实机器无退化（磁盘 1526MB/s、热态 7.2s/it），定位为冷态成本叠加；试 FastH3 4 步模型后放弃并清除；热态实测成绩：T2V 91 秒、R2V 0.2MP 106~143 秒、0.4MP I2V 197~222 秒、0.4MP 竖屏 R2V 255 秒 |
 
 ---
 ---
@@ -228,15 +235,16 @@ pip 包备份：`D:\ai\pip_freeze_backup.txt`；nightly 安装包留存：`D:\ai
 
 > **Credits**: This project was deployed based on the open-source tutorial [a756598009-CMYK/MiniMax-H3-AMD7900XTX-Win11](https://github.com/a756598009-CMYK/MiniMax-H3-AMD7900XTX-Win11) by the original author. The model bundle and workflow ideas come from the author — full credit. This document records the speed-tuning and troubleshooting experience built on top of it.
 
-> **Latest results (2026-09-21, warm-state, measured)**
+> **Measured results (2026-09-21, warm-state records; all at 124 frames / 6 steps)**
 >
-> | Task | Parameters | Total time |
+> | Task | Resolution | Total time |
 > |---|---|---|
-> | Text-to-Video (T2V) | 608×352 / 124 frames / 6 steps | **90 s** |
-> | Reference-to-Video (R2V, dual reference images) | 608×352 / 124 frames / 6 steps / max face-preservation | **105~142 s** |
-> | Reference-to-Video (R2V, single reference image) | 608×352 / 124 frames / 6 steps / max face-preservation | **178 s** (baseline) |
+> | Text-to-Video (T2V) | 608×352 (0.2MP) | **91 s** |
+> | Reference-to-Video (R2V, dual reference images) | 352×608 (0.2MP) | **106~143 s** |
+> | First-frame Image-to-Video (I2V) | 832×480 (0.4MP) | **197~222 s** |
+> | Reference-to-Video (R2V, dual reference, portrait) | 480×832 (0.4MP) | **255 s** |
 >
-> Starting point the same day: 11~15 min (I2V) / 34 min (R2V). Overall speedup: **7~14×**.
+> Starting point the same day: 11~15 min (I2V) / 34 min (R2V). Overall speedup: **8~14×**.
 
 ---
 
@@ -306,22 +314,28 @@ python_embeded\python.exe -s ComfyUI\main.py --windows-standalone-build --use-sa
 ## 5. Workflow Speed Configuration Essentials (Reference-to-Video R2V)
 
 1. **Use the `MiniMaxH3INT8FastLoader`** (the minimax h3 preset from INT8-Fast-ROCM) — direct INT8 model loading + WMMA acceleration
-2. **Turbo LoRA + 6 steps**: 6 steps is the sweet spot. Measured: 10 steps cost 67% more sampling time, and with a turbo distilled LoRA too many steps cause overexposure and color shift — quality actually gets worse
+2. **Turbo LoRA + 6 steps**: 6 steps is the sweet spot. Measured at 0.4MP: 6 steps = 255 s vs 10 steps = 262 s — almost no difference in total time (sampling is only half the pipeline, and Spectrum skips part of the steps anyway); but too many steps with a turbo distilled LoRA risk overexposure and color shift — lock to 6 steps
 3. **`ref_image_size=max`: the key to preserving faces**. `match` mode compresses the reference image to the generation resolution (a few hundred thousand pixels) and faces always collapse; `max` keeps identity with a 2048px short edge — slower, but worth it
 4. **Place the Spectrum node after the LoRA**: ~1/3 of steps use prediction instead of real computation; if you notice degraded detail, right-click → Bypass to roll back
 5. **Set the seed to randomize**: ComfyUI has incremental execution — when the reference image and prompt are unchanged, reruns skip the entire encoding stage (the single biggest time block). A randomized seed guarantees a new clip every run
-6. Resolution 608×352, 124 frames (24fps ≈ 5 s) is the sweet spot for a 20GB card
+6. Resolution 608×352, 124 frames (24fps ≈ 5 s) is the sweet spot for a 20GB card; 0.4MP (480×832 / 832×480) also works stably — see Section 6
 
-## 6. Parameter Safety Zone (20GB VRAM, measured 2026-09-21)
+## 6. Parameter Safety Zone & Measured Times (20GB VRAM, warm-state records, 2026-09-21)
 
-| Parameter combination | Result |
-|---|---|
-| 608×352 / 124 frames / 6 steps | ✅ Safe sweet spot: T2V 90 s, R2V 105~178 s |
-| 480×832 portrait / 124 frames / 10 steps | ⚠️ Edge: 10~12 min total, ~5 min of that is decoding alone |
-| 480×832 portrait / 124 frames (repeated runs) | ❌ Triggers a **true deadlock** in the VAE decode stage (see Section 9); process restart required |
-| Steps 6 → 10 | ❌ 67% more time, overexposure/color shift under turbo LoRA, no quality gain |
+| Combination (all at 124 frames) | Measured total | Verdict |
+|---|---|---|
+| 608×352 / 6 steps / T2V | 91 s | ✅ Fastest |
+| 352×608 / 6 steps / R2V dual-ref | 106~143 s | ✅ |
+| 832×480 (0.4MP landscape) / 6 steps / I2V | 197~222 s | ✅ |
+| 480×832 (0.4MP portrait) / 6 steps / R2V dual-ref | 255 s | ✅ Usable |
+| 480×832 / 10 steps / R2V dual-ref | 262 s | Nearly identical to 6 steps — extra steps not worth it |
+| 480×832 / cold state or under heavy system load | 10~20 min observed, plus one true decode deadlock | ⚠️ Abnormal-period behavior, not real speed (see Sections 8–9) |
 
-**Rule of thumb**: intermediate activations in the decode stage scale with pixel count. 480×832 has 87% more pixels than 608×352 — sampling and decoding slow down proportionally, and the decode VRAM peak approaches the ceiling the dynamic scheduler can free up. For portrait video, reduce frame count (61/89 frames) instead of forcing 124.
+**Rules of thumb**:
+
+- 0.4MP is ~2–2.5× slower than 0.2MP (super-linear); the bottleneck is encoding and decoding, not sampling
+- The VAE decode stage **has no progress bar**; 0.4MP decoding takes several minutes — a silent log ≠ a freeze
+- Judge speed by the *second consecutive run*; the cost of a cold first run is covered in Section 8
 
 ## 7. Speed Evolution (same 7900 XT)
 
@@ -331,16 +345,16 @@ python_embeded\python.exe -s ComfyUI\main.py --windows-standalone-build --use-sa
 | +sage 1.0.6, reserve-vram 1.0 | | ~26 min | 55~73 s/step |
 | +Spectrum | | 22 min | — |
 | +nightly torch + sage 2.2 | | 178 s | 9~17 s/step |
-| **Final (warm-state back-to-back runs)** | same as above | **R2V dual-ref 105~142 s / T2V 90 s** | **7.2~13.7 s/step** |
+| **Final (warm-state back-to-back runs)** | same as above | **T2V 91 s / R2V 0.2MP 106~143 s / 0.4MP 197~262 s** | **7.2~20 s/step** |
 
 ## 8. Cold State vs Warm State — the Biggest Source of "Suddenly Slow" (full-day investigation, 2026-09-21)
 
-The same baseline task measured 178 s → 589 s → back to 105 s within a single day. Conclusion: **no hardware/driver degradation at all** — the variance came entirely from cold-state costs:
+The same baseline task measured 178 s → 589 s → back to 91~262 s within a single day. Conclusion: **no hardware/driver degradation at all** — the variance came entirely from cold-state costs:
 
 1. **Cold load**: after restarting ComfyUI (or when models were evicted after long idle), the first run re-reads ~35GB from disk (19.5GB main model + 15GB text encoder + dual VAE), plus 41 s of model initialization. An 8~10 min first run is normal
 2. **Disk cache washed out**: downloading/deleting tens of GB in a short time (e.g., trying new models), or post-Windows-update background housekeeping, flushes the file cache. Measured cold python read then drops to **74 MB/s** (normal: 1500+ MB/s) — loading takes 10× longer
 3. **Disk contention**: concurrent downloads, hash checks, antivirus scans drag model loading to several minutes
-4. **Warm state is the real speed**: with models resident, back-to-back runs sample at 7~14 s/step and encoding is fully skipped — T2V in 90 s
+4. **Warm state is the real speed**: with models resident, back-to-back runs sample at 7~20 s/step and encoding is fully skipped — T2V in 91 s
 
 **Conclusion**: judge speed by the *second consecutive run*; a slow first run after restart ≠ the machine got slower.
 
@@ -352,7 +366,7 @@ ComfyUI's tqdm progress bar is buffered and the VAE decode stage **prints no pro
 |---|---|---|---|---|
 | Encoding / loading | ~0% | yes | sustained reads | Fake freeze — wait |
 | Sampling | sustained 95~100% | low | ~0 | Normal |
-| **VAE decoding** | **saturated 180~340%** | single core busy | ~0 | **Fake freeze** (no progress in log; 480×832 decode ≈ 5 min — wait) |
+| **VAE decoding** | **saturated 180~340%** | single core busy | ~0 | **Fake freeze** (no progress in log; 0.4MP decode takes several minutes — wait) |
 | **True deadlock** | **0%** | **0.00s** | **0 MB/s** | Truly dead — kill and restart |
 
 ```powershell
@@ -437,4 +451,4 @@ pip package backup: `D:\ai\pip_freeze_backup.txt`; retained nightly wheels: `D:\
 | 2026-09-08 | Deployment complete; R2V workflow running; fixed missing ComfyUI-Manager and Easy-Use extension errors |
 | 2026-09-09 | Tuned to the 178 s baseline; compiled an MP-pixel-to-resolution reference table |
 | 2026-09-12 | Fixed sage autotune freeze (locked champion config); restored fast-start mode |
-| 2026-09-21 | All-day "got slower" investigation: confirmed no hardware degradation (disk 1526MB/s, warm-state 7.2 s/it); attributed variance to cold-state costs + 10 steps + large portrait resolution stacking; tried and abandoned the FastH3 4-step model (deleted); final warm-state results: T2V 90 s, R2V dual-ref 105~142 s |
+| 2026-09-21 | All-day "got slower" investigation: confirmed no hardware degradation (disk 1526MB/s, warm-state 7.2 s/it); attributed variance to stacked cold-state costs; tried and abandoned the FastH3 4-step model (deleted); final warm-state results: T2V 91 s, R2V 0.2MP 106~143 s, 0.4MP I2V 197~222 s, 0.4MP portrait R2V 255 s |
